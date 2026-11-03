@@ -10,3 +10,5 @@ craft-anything-engine = { workspace = true }
 toml = { workspace = true }
 syn = { version = "2", features = ["full", "visit"] }
 proc-macro2 = { version = "1", features = ["span-locations"] }
+# TODO: repoint to storytold/craft-libs after upstream merge
+craft-xtask = { git = "https://github.com/cloudbring/craft-libs", branch = "algo/integration" }

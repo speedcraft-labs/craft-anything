@@ -5,7 +5,6 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 mod i18n_coverage;
-mod ico;
 mod locks;
 mod secrets;
 
@@ -46,10 +45,7 @@ fn main() -> ExitCode {
         Some("version") => version(&root, args.get(1).map(String::as_str), args.get(2).map(String::as_str)),
         Some("pending") => pending(&root, args.iter().any(|a| a == "--count")),
         Some("secrets") => secrets::secrets(&root, args.iter().any(|a| a == "--history")),
-        Some("ico") => {
-            let rest: Vec<&str> = args.iter().skip(1).map(String::as_str).collect();
-            ico::run(&rest).map_err(|e| eprintln!("ico: {e}")).is_ok()
-        }
+        Some("ico") => run_ico(&root, &args[1..]).map_err(|e| eprintln!("ico: {e}")).is_ok(),
         Some("ci") => {
             layers(&root)
                 && locks::check(&root)
@@ -66,9 +62,7 @@ fn main() -> ExitCode {
                 && wasm()
         }
         _ => {
-            eprintln!(
-                "usage: cargo xtask <layers | locks | i18n-coverage | tools [--check] | wasm | licenses | schemas [--check] | pending [--count] | secrets [--history] | ci | version [set X.Y.Z] | ico <out.ico> <png>...>"
-            );
+            eprintln!("{}", usage());
             false
         }
     };
@@ -481,4 +475,33 @@ fn pending(root: &Path, count_only: bool) -> bool {
     }
     println!("{total} open item(s) under {} roadmap entr{}", groups.len(), if groups.len() == 1 { "y" } else { "ies" });
     true
+}
+
+fn usage() -> String {
+    format!(
+        "usage: cargo xtask <layers | locks | i18n-coverage | tools [--check] | wasm | licenses | schemas [--check] | pending [--count] | secrets [--history] | ci | version [set X.Y.Z] | ico <out.ico> <png>...>\nShared task syntax:\n  {}",
+        craft_xtask::ico::cli_help()
+    )
+}
+
+fn ico_config(root: &Path) -> craft_xtask::ico::Config {
+    craft_xtask::ico::Config {
+        root: root.to_path_buf(),
+        source_pngs: [16, 24, 32, 48, 64, 128, 256]
+            .into_iter()
+            .map(|s| PathBuf::from(format!("assets/app-icon/hicolor/{s}x{s}/apps/ai.storyteller.craft-anything.png")))
+            .collect(),
+        output_path: Some(PathBuf::from("assets/app-icon/craft-anything.ico")),
+        sizes: Vec::new(),
+        icns: false,
+    }
+}
+
+fn run_ico(root: &Path, args: &[String]) -> Result<(), String> {
+    if args.len() < 2 {
+        return Err("usage: cargo xtask ico <out.ico> <png>...".into());
+    }
+    let cfg = craft_xtask::ico::Config { root: PathBuf::from("."), ..ico_config(root) };
+    let report = craft_xtask::ico::compute(&cfg, &craft_xtask::ico::Args::parse(args)?)?;
+    craft_xtask::ico::apply(&report)
 }

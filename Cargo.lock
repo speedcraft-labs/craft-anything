@@ -1413,6 +1413,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "craft-hash"
+version = "0.1.0"
+source = "git+https://github.com/cloudbring/craft-libs?branch=algo%2Fintegration#4acbbe26f475c3ad98a44a654553a5711929d6d3"
+dependencies = [
+ "sha2",
+]
+
+[[package]]
+name = "craft-xtask"
+version = "0.1.0"
+source = "git+https://github.com/cloudbring/craft-libs?branch=algo%2Fintegration#4acbbe26f475c3ad98a44a654553a5711929d6d3"
+dependencies = [
+ "craft-hash",
+ "glob",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "cranelift-assembler-x64"
 version = "0.136.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7973,6 +7992,7 @@ name = "xtask"
 version = "0.3.0"
 dependencies = [
  "craft-anything-engine",
+ "craft-xtask",
  "proc-macro2",
  "syn 2.0.119",
  "toml 0.9.12+spec-1.1.0",
