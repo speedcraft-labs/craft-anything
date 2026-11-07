@@ -419,6 +419,16 @@ struct Probe {
     searched: Option<bool>,
 }
 
+/// Add one chunk to the boundary carry and test it. Keeping only `longest` bytes is enough to
+/// preserve matches split across reads.
+fn append_and_check(carry: &mut Vec<u8>, longest: usize, chunk: &[u8], matches: impl FnOnce(&[u8]) -> bool) -> bool {
+    carry.extend_from_slice(chunk);
+    let found = matches(carry);
+    let keep = carry.len().saturating_sub(longest);
+    carry.drain(..keep);
+    found
+}
+
 impl Probe {
     fn open(path: &Path, text_budget: bool) -> Option<Probe> {
         let file = File::open(path).ok()?;
@@ -466,10 +476,12 @@ impl Probe {
         if let Some(found) = self.searched {
             return found;
         }
+        let needles: Vec<_> = needles.iter().copied().filter(|n| !n.is_empty()).collect();
         let longest = needles.iter().map(|n| n.len()).max().unwrap_or(0);
         if !self.text_budget || longest == 0 {
             return false;
         }
+        let matcher = craft_text::matching::overlapping_byte_matcher(&needles).ok();
         let mut found = false;
         let (mut at, mut carry) = (0u64, Vec::new());
         while at < self.len.min(TEXT_WINDOW) && !found {
@@ -478,10 +490,9 @@ impl Probe {
                 break;
             }
             at = at.saturating_add(chunk.len() as u64);
-            carry.extend_from_slice(&chunk);
-            found = needles.iter().any(|n| !n.is_empty() && carry.windows(n.len()).any(|w| w == *n));
-            let keep = carry.len().saturating_sub(longest);
-            carry.drain(..keep);
+            found = append_and_check(&mut carry, longest, &chunk, |bytes| {
+                matcher.as_ref().map_or_else(|| needles.iter().any(|n| bytes.windows(n.len()).any(|w| w == *n)), |matcher| matcher.is_match(bytes))
+            });
         }
         self.searched = Some(found);
         found
@@ -953,7 +964,27 @@ mod tests {
     use super::*;
     use crate::Engine;
     use craft_anything_testkit::games::{GodotFile, Il2cppSample, godot_embedded, godot_pck, il2cpp_metadata};
+    use proptest::prelude::*;
     use std::collections::HashSet;
+
+    proptest! {
+        #[test]
+        fn chunked_shared_search_matches_naive(
+            haystack in prop::collection::vec(any::<u8>(), 0..256),
+            patterns in prop::collection::vec(prop::collection::vec(any::<u8>(), 1..12), 1..8),
+            chunk_size in 1usize..32,
+        ) {
+            let refs: Vec<_> = patterns.iter().map(Vec::as_slice).collect();
+            let matcher = craft_text::matching::overlapping_byte_matcher(&refs).unwrap();
+            let longest = patterns.iter().map(Vec::len).max().unwrap_or(0);
+            let mut carry = Vec::new();
+            let actual = haystack.chunks(chunk_size).any(|chunk| {
+                append_and_check(&mut carry, longest, chunk, |bytes| matcher.is_match(bytes))
+            });
+            let expected = patterns.iter().any(|needle| haystack.windows(needle.len()).any(|window| window == needle));
+            prop_assert_eq!(actual, expected);
+        }
+    }
 
     fn engine() -> Engine {
         Engine::new(crate::testing::session())

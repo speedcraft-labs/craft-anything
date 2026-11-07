@@ -293,6 +293,7 @@ fn is_secret_json_key(k: &str) -> bool {
 struct Scrub {
     /// Every spelling of every value the caller named.
     needles: Vec<String>,
+    matcher: Option<aho_corasick::AhoCorasick>,
     dropped: Dropped,
 }
 
@@ -327,11 +328,12 @@ fn user_info_end(after_slashes: &str) -> Option<usize> {
 
 impl Scrub {
     fn new(values: &[String]) -> Scrub {
-        Scrub { needles: Redactor::new(values).needles, dropped: Dropped::default() }
+        let redactor = Redactor::new(values);
+        Scrub { needles: redactor.needles, matcher: redactor.matcher, dropped: Dropped::default() }
     }
 
     fn holds_hidden(&self, s: &str) -> bool {
-        self.needles.iter().any(|n| s.contains(n.as_str()))
+        self.matcher.as_ref().map_or_else(|| self.needles.iter().any(|n| s.contains(n.as_str())), |matcher| matcher.is_match(s))
     }
 
     fn hide(&mut self, s: String) -> String {

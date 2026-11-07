@@ -67,6 +67,7 @@ pub struct HarOptions {
 pub(crate) struct Redactor {
     /// Every spelling of every declared value, longest first.
     pub(crate) needles: Vec<String>,
+    pub(crate) matcher: Option<aho_corasick::AhoCorasick>,
     log: Vec<Value>,
 }
 
@@ -94,11 +95,17 @@ impl Redactor {
             }
         }
         needles.sort_by_key(|n| std::cmp::Reverse(n.len()));
-        Redactor { needles, log: Vec::new() }
+        let matcher = if needles.len() > 3 {
+            let refs: Vec<_> = needles.iter().map(String::as_str).collect();
+            craft_text::matching::literal_matcher(&refs, false).ok()
+        } else {
+            None
+        };
+        Redactor { needles, matcher, log: Vec::new() }
     }
 
     fn contains(&self, s: &str) -> bool {
-        self.needles.iter().any(|n| s.contains(n.as_str()))
+        self.matcher.as_ref().map_or_else(|| self.needles.iter().any(|n| s.contains(n.as_str())), |matcher| matcher.is_match(s))
     }
 
     /// Replace declared values in kept text.
@@ -273,12 +280,13 @@ pub fn json_outline(v: &Value, depth: usize, red: &mut OutlineRedactions<'_>, po
 /// Redaction context for outlines (only property names can leak).
 pub struct OutlineRedactions<'r> {
     needles: &'r [String],
+    matcher: Option<&'r aho_corasick::AhoCorasick>,
     pub log: Vec<Value>,
 }
 
 impl OutlineRedactions<'_> {
     fn names_hit(&self, k: &str) -> bool {
-        self.needles.iter().any(|n| k.contains(n.as_str()))
+        self.matcher.map_or_else(|| self.needles.iter().any(|n| k.contains(n.as_str())), |matcher| matcher.is_match(k))
     }
 }
 
@@ -329,7 +337,7 @@ fn body_outline(
     let decoded = decoded_bytes.as_deref().map(|b| String::from_utf8_lossy(b).into_owned());
     let json_like = mime_l.contains("json") || decoded.as_deref().is_some_and(|t| t.trim_start().starts_with('{') || t.trim_start().starts_with('['));
     if json_like && let Some(v) = decoded.as_deref().and_then(|t| serde_json::from_str::<Value>(t).ok()) {
-        let mut sr = OutlineRedactions { needles: &red.needles, log: Vec::new() };
+        let mut sr = OutlineRedactions { needles: &red.needles, matcher: red.matcher.as_ref(), log: Vec::new() };
         let outline = json_outline(&v, 0, &mut sr, pointer);
         red.log.extend(sr.log);
         return json!({"kind": "json", "bytes": bytes, "outline": outline});

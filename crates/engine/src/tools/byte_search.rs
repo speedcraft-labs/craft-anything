@@ -74,6 +74,8 @@ pub struct SearchBytesParams {
 
 /// One byte of a signature: `None` matches anything.
 type Pat = Vec<Option<u8>>;
+type SearchHit = (usize, usize, &'static str);
+type MultiSearchResult = (Vec<SearchHit>, bool);
 
 /// Parse hex byte pairs and `??` wildcards (whitespace ignored).
 fn parse_pattern(s: &str) -> Result<Pat, ToolError> {
@@ -135,6 +137,28 @@ fn find_all(data: &[u8], pat: &Pat, cap: usize, cancelled: &dyn Fn() -> bool) ->
     (hits, false)
 }
 
+/// Single-pass multi-literal search with the legacy pattern-order match budget.
+fn find_many_fixed_bytes(data: &[u8], needles: &[(&'static str, Pat)], cap: usize) -> Result<MultiSearchResult, ToolError> {
+    let patterns: Vec<Vec<u8>> = needles.iter().map(|(_, pat)| pat.iter().filter_map(|b| *b).collect()).collect();
+    let refs: Vec<_> = patterns.iter().map(Vec::as_slice).collect();
+    let matcher = craft_text::matching::overlapping_byte_matcher(&refs).map_err(|_| ToolError::internal("could not compile literal search matcher"))?;
+    let mut by_pattern = vec![Vec::new(); needles.len()];
+    for hit in craft_text::matching::find_bytes_overlapping_limited(&matcher, data, cap.saturating_add(1)) {
+        if let Some(offsets) = by_pattern.get_mut(hit.pattern) {
+            offsets.push(hit.start);
+        }
+    }
+    let mut found = Vec::new();
+    let mut capped = false;
+    for (i, (what, pat)) in needles.iter().enumerate() {
+        let room = cap.saturating_sub(found.len());
+        let offsets = by_pattern.get(i).map_or(&[][..], Vec::as_slice);
+        capped |= offsets.len() > room;
+        found.extend(offsets.iter().take(room).map(|&offset| (offset, pat.len(), *what)));
+    }
+    Ok((found, capped))
+}
+
 #[derive(Debug, Serialize)]
 struct Hit {
     file_offset: u64,
@@ -183,12 +207,23 @@ fn native_bytes_find(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, Too
     let cancel = ctx.cancel.clone();
     let mut hits: Vec<(usize, usize, &'static str)> = Vec::new();
     let mut capped = false;
-    for (what, pat) in &needles {
-        let room = MAX_MATCHES.saturating_sub(hits.len());
-        let (found, stopped) = find_all(&input.bytes, pat, room, &|| cancel.is_cancelled());
+    // Bound the shared, non-interruptible automaton pass to the same byte window in which the
+    // legacy scanner checks cancellation; very large files keep the responsive per-pattern path.
+    let shared_literals = needles.len() > 1 && input.bytes.len() <= (8 << 20) && needles.iter().all(|(_, pat)| pat.iter().all(Option::is_some));
+    if shared_literals {
+        ctx.cancel.check()?;
+        let (found, stopped) = find_many_fixed_bytes(&input.bytes, &needles, MAX_MATCHES)?;
         ctx.cancel.check()?;
         capped |= stopped;
-        hits.extend(found.into_iter().map(|o| (o, pat.len(), *what)));
+        hits.extend(found);
+    } else {
+        for (what, pat) in &needles {
+            let room = MAX_MATCHES.saturating_sub(hits.len());
+            let (found, stopped) = find_all(&input.bytes, pat, room, &|| cancel.is_cancelled());
+            ctx.cancel.check()?;
+            capped |= stopped;
+            hits.extend(found.into_iter().map(|o| (o, pat.len(), *what)));
+        }
     }
     hits.sort_unstable();
 
@@ -262,9 +297,10 @@ fn native_bytes_find(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, Too
 #[cfg(test)]
 mod tests {
     use super::super::native_common::test_support::{call, call_err, engine_with};
-    use super::{find_all, parse_pattern};
+    use super::{Pat, find_all, find_many_fixed_bytes, parse_pattern};
     use crate::Engine;
     use craft_anything_testkit as tk;
+    use proptest::prelude::*;
     use serde_json::json;
 
     #[test]
@@ -291,6 +327,45 @@ mod tests {
         // A pattern longer than the data, or hanging off the end, never matches.
         let (h, _) = find_all(b"\xaa", &parse_pattern("aa bb").unwrap(), 10, &|| false);
         assert!(h.is_empty());
+    }
+
+    #[test]
+    fn shared_literal_scan_matches_legacy_order_and_cap() {
+        let data = b"aa--aa--ababa";
+        let needles = vec![("utf8", b"aa".iter().copied().map(Some).collect()), ("utf16le", b"--".iter().copied().map(Some).collect())];
+        for cap in [1usize, 2, 5, 10] {
+            let mut expected = Vec::new();
+            let mut expected_capped = false;
+            for (what, pat) in &needles {
+                let room = cap.saturating_sub(expected.len());
+                let (found, stopped) = find_all(data, pat, room, &|| false);
+                expected_capped |= stopped;
+                expected.extend(found.into_iter().map(|offset| (offset, pat.len(), *what)));
+            }
+            assert_eq!(find_many_fixed_bytes(data, &needles, cap).unwrap(), (expected, expected_capped));
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn shared_literal_scan_matches_legacy_on_generated_inputs(
+            data in prop::collection::vec(any::<u8>(), 0..128),
+            patterns in prop::collection::vec(prop::collection::vec(any::<u8>(), 1..10), 1..6),
+            cap in 0usize..20,
+        ) {
+            let needles: Vec<(&'static str, Pat)> = patterns.iter()
+                .map(|needle| ("utf8", needle.iter().copied().map(Some).collect()))
+                .collect();
+            let mut expected = Vec::new();
+            let mut expected_capped = false;
+            for (what, pat) in &needles {
+                let room = cap.saturating_sub(expected.len());
+                let (found, stopped) = find_all(&data, pat, room, &|| false);
+                expected_capped |= stopped;
+                expected.extend(found.into_iter().map(|offset| (offset, pat.len(), *what)));
+            }
+            prop_assert_eq!(find_many_fixed_bytes(&data, &needles, cap).unwrap(), (expected, expected_capped));
+        }
     }
 
     #[test]
