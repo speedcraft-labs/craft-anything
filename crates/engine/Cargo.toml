@@ -10,6 +10,7 @@ publish = false
 workspace = true
 
 [dependencies]
+craft-text = { workspace = true }
 craft-anything-evidence = { workspace = true }
 craft-anything-formats = { workspace = true }
 craft-anything-disasm = { workspace = true }
@@ -43,4 +44,5 @@ wasm-plugins = ["craft-anything-engines/wasm-plugins"]
 [dev-dependencies]
 sha1 = "0.10"
 craft-anything-testkit = { workspace = true }
+proptest = { workspace = true }
 tempfile = "3"
