@@ -1222,6 +1222,7 @@ dependencies = [
  "hex",
  "image",
  "log",
+ "memchr",
  "png 0.17.16",
  "regex",
  "schemars",
