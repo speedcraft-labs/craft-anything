@@ -3,7 +3,7 @@
 
 use crate::js_app::{AppGraph, ModuleSummary};
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 fn set<'a>(it: impl Iterator<Item = &'a str>) -> BTreeSet<String> {
     it.map(String::from).collect()
@@ -72,15 +72,31 @@ fn match_modules<'a>(l: &'a [ModuleSummary], r: &'a [ModuleSummary]) -> Value {
         count.into_iter().filter(|(_, n)| *n == 1).map(|(k, _)| k).collect::<BTreeSet<String>>()
     };
     let (unique_l, unique_r) = (unique(l), unique(r));
-    let mut used: BTreeSet<usize> = BTreeSet::new();
+    let mut used = vec![false; r.len()];
+    let mut paths = HashMap::<&str, usize>::with_capacity(r.len());
+    let mut hashes = HashMap::<&str, (Vec<usize>, usize)>::new();
+    let mut hashless_paths = HashMap::<String, usize>::new();
+    let mut fingerprints = HashMap::<&str, (Vec<usize>, usize)>::new();
+    for (i, module) in r.iter().enumerate() {
+        paths.entry(module.path.as_str()).or_insert(i);
+        if !module.sha256.is_empty() {
+            hashes.entry(module.sha256.as_str()).or_insert_with(|| (Vec::new(), 0)).0.push(i);
+        }
+        if let Some(key) = without_build_hash(&module.path) {
+            hashless_paths.entry(key).or_insert(i);
+        }
+        if let Some(key) = module.fingerprint.as_deref() {
+            fingerprints.entry(key).or_insert_with(|| (Vec::new(), 0)).0.push(i);
+        }
+    }
     let mut unchanged = 0usize;
     let mut changed = Vec::new();
     let mut moved = Vec::new();
     let mut renamed = Vec::new();
     let mut removed = Vec::new();
     for m in l {
-        if let Some(i) = r.iter().position(|x| x.path == m.path) {
-            used.insert(i);
+        if let Some(&i) = paths.get(m.path.as_str()) {
+            used[i] = true;
             match r.get(i) {
                 Some(x) if same_content(x, m) => unchanged += 1,
                 Some(x) => changed.push(json!({
@@ -94,14 +110,14 @@ fn match_modules<'a>(l: &'a [ModuleSummary], r: &'a [ModuleSummary]) -> Value {
             }
             continue;
         }
-        if let Some(i) = r.iter().enumerate().position(|(i, x)| !used.contains(&i) && x.sha256 == m.sha256 && !m.sha256.is_empty()) {
-            used.insert(i);
+        if let Some(i) = take_unused(&mut hashes, m.sha256.as_str(), &used) {
+            used[i] = true;
             moved.push(json!({"from": m.path, "to": r.get(i).map(|x| &x.path)}));
             continue;
         }
         let hashless = without_build_hash(&m.path).filter(|k| unique_l.contains(k) && unique_r.contains(k));
-        if let Some(i) = hashless.and_then(|k| r.iter().enumerate().position(|(i, x)| !used.contains(&i) && without_build_hash(&x.path).as_ref() == Some(&k))) {
-            used.insert(i);
+        if let Some(i) = hashless.and_then(|k| hashless_paths.get(k.as_str()).copied()).filter(|&i| !used[i]) {
+            used[i] = true;
             if let Some(x) = r.get(i) {
                 changed.push(json!({
                     "path": x.path,
@@ -115,14 +131,14 @@ fn match_modules<'a>(l: &'a [ModuleSummary], r: &'a [ModuleSummary]) -> Value {
             }
             continue;
         }
-        if let Some(i) = r.iter().enumerate().position(|(i, x)| !used.contains(&i) && x.fingerprint.is_some() && x.fingerprint == m.fingerprint) {
-            used.insert(i);
+        if let Some(i) = m.fingerprint.as_deref().and_then(|key| take_unused(&mut fingerprints, key, &used)) {
+            used[i] = true;
             renamed.push(json!({"from": m.path, "to": r.get(i).map(|x| &x.path), "matched_by": "structure"}));
             continue;
         }
         removed.push(m.path.clone());
     }
-    let added: Vec<&String> = r.iter().enumerate().filter(|(i, _)| !used.contains(i)).map(|(_, x)| &x.path).collect();
+    let added: Vec<&String> = r.iter().enumerate().filter(|(i, _)| !used[*i]).map(|(_, x)| &x.path).collect();
     json!({"unchanged": unchanged, "changed": changed, "moved": moved, "renamed": renamed, "added": added, "removed": removed})
 }
 
@@ -138,27 +154,45 @@ fn export_diff(a: &ModuleSummary, b: &ModuleSummary) -> Value {
     v
 }
 
+/// Return the first still-available position for a key. Each key keeps a forward cursor, so
+/// repeated hashes do not repeatedly walk positions already consumed by an earlier tier.
+fn take_unused(index: &mut HashMap<&str, (Vec<usize>, usize)>, key: &str, used: &[bool]) -> Option<usize> {
+    let (positions, cursor) = index.get_mut(key)?;
+    while let Some(&i) = positions.get(*cursor) {
+        *cursor += 1;
+        if !used[i] {
+            return Some(i);
+        }
+    }
+    None
+}
+
 /// Bundle modules across both graphs: by content, then structure, then id.
 fn match_bundle_modules(l: &AppGraph, r: &AppGraph) -> Value {
     let lm: Vec<(&str, &crate::js_app::BundleModuleSummary)> =
         l.modules.iter().flat_map(|m| m.bundle_modules.iter().map(move |b| (m.path.as_str(), b))).collect();
     let rm: Vec<(&str, &crate::js_app::BundleModuleSummary)> =
         r.modules.iter().flat_map(|m| m.bundle_modules.iter().map(move |b| (m.path.as_str(), b))).collect();
-    let mut used = BTreeSet::new();
+    let mut used = vec![false; rm.len()];
+    let mut content = HashMap::<&str, (Vec<usize>, usize)>::new();
+    let mut structure = HashMap::<&str, (Vec<usize>, usize)>::new();
+    let mut ids = HashMap::<&str, (Vec<usize>, usize)>::new();
+    for (i, (_, module)) in rm.iter().enumerate() {
+        content.entry(module.sha256.as_str()).or_insert_with(|| (Vec::new(), 0)).0.push(i);
+        structure.entry(module.fingerprint.as_str()).or_insert_with(|| (Vec::new(), 0)).0.push(i);
+        ids.entry(module.id.as_str()).or_insert_with(|| (Vec::new(), 0)).0.push(i);
+    }
     let mut tiers: BTreeMap<&str, usize> = BTreeMap::new();
     let mut changed = Vec::new();
     let mut removed = Vec::new();
     for (lp, b) in &lm {
-        let tier = [
-            ("content", rm.iter().enumerate().position(|(i, (_, x))| !used.contains(&i) && x.sha256 == b.sha256)),
-            ("structure", rm.iter().enumerate().position(|(i, (_, x))| !used.contains(&i) && x.fingerprint == b.fingerprint)),
-            ("id", rm.iter().enumerate().position(|(i, (_, x))| !used.contains(&i) && x.id == b.id)),
-        ]
-        .into_iter()
-        .find_map(|(t, i)| i.map(|i| (t, i)));
+        let tier = take_unused(&mut content, b.sha256.as_str(), &used)
+            .map(|i| ("content", i))
+            .or_else(|| take_unused(&mut structure, b.fingerprint.as_str(), &used).map(|i| ("structure", i)))
+            .or_else(|| take_unused(&mut ids, b.id.as_str(), &used).map(|i| ("id", i)));
         match tier {
             Some((t, i)) => {
-                used.insert(i);
+                used[i] = true;
                 *tiers.entry(t).or_default() += 1;
                 if t == "id" && changed.len() < 2000 {
                     changed.push(json!({"id": b.id, "file": lp}));
@@ -167,7 +201,7 @@ fn match_bundle_modules(l: &AppGraph, r: &AppGraph) -> Value {
             None => removed.push(json!({"id": b.id, "file": lp})),
         }
     }
-    let added: Vec<Value> = rm.iter().enumerate().filter(|(i, _)| !used.contains(i)).map(|(_, (p, b))| json!({"id": b.id, "file": p})).take(2000).collect();
+    let added: Vec<Value> = rm.iter().enumerate().filter(|(i, _)| !used[*i]).map(|(_, (p, b))| json!({"id": b.id, "file": p})).take(2000).collect();
     json!({"left": lm.len(), "right": rm.len(), "matched_by": tiers, "changed": changed, "added": added, "removed": removed})
 }
 
@@ -291,17 +325,21 @@ pub fn compare_versions(l: &AppGraph, r: &AppGraph) -> Value {
 /// Export outlines module by module (matched by path, then by structure).
 pub fn compare_export_outlines(l: &AppGraph, r: &AppGraph) -> Value {
     let mut rows = Vec::new();
-    let mut used = BTreeSet::new();
+    let mut used = vec![false; r.modules.len()];
+    let mut paths = HashMap::<&str, usize>::with_capacity(r.modules.len());
+    let mut fingerprints = HashMap::<&str, usize>::new();
+    for (i, module) in r.modules.iter().enumerate() {
+        paths.entry(module.path.as_str()).or_insert(i);
+        if let Some(key) = module.fingerprint.as_deref() {
+            fingerprints.entry(key).or_insert(i);
+        }
+    }
     let mut changed = 0usize;
     for m in l.modules.iter().filter(|m| m.kind == "script") {
-        let idx = r
-            .modules
-            .iter()
-            .position(|x| x.path == m.path)
-            .or_else(|| r.modules.iter().position(|x| x.fingerprint.is_some() && x.fingerprint == m.fingerprint));
+        let idx = paths.get(m.path.as_str()).copied().or_else(|| m.fingerprint.as_deref().and_then(|key| fingerprints.get(key).copied()));
         match idx.and_then(|i| r.modules.get(i).map(|x| (i, x))) {
             Some((i, x)) => {
-                used.insert(i);
+                used[i] = true;
                 let d = export_diff(m, x);
                 let same =
                     d["added"].as_array().is_some_and(Vec::is_empty) && d["removed"].as_array().is_some_and(Vec::is_empty) && d.get("module_exports").is_none();
@@ -314,7 +352,7 @@ pub fn compare_export_outlines(l: &AppGraph, r: &AppGraph) -> Value {
         }
     }
     for (i, x) in r.modules.iter().enumerate().filter(|(_, x)| x.kind == "script") {
-        if !used.contains(&i) {
+        if !used[i] {
             rows.push(json!({"left": null, "right": x.path, "added": true, "right_outline": x.exports}));
         }
     }
@@ -326,6 +364,184 @@ mod tests {
     use super::*;
     use crate::js_app::tests_support::{graph_of, notes_graph};
     use craft_anything_testkit::electron as fx;
+    use proptest::prelude::*;
+
+    fn linear_match_modules(l: &[ModuleSummary], r: &[ModuleSummary]) -> Value {
+        let unique = |mods: &[ModuleSummary]| {
+            let mut count: BTreeMap<String, usize> = BTreeMap::new();
+            for m in mods {
+                if let Some(k) = without_build_hash(&m.path) {
+                    *count.entry(k).or_default() += 1;
+                }
+            }
+            count.into_iter().filter(|(_, n)| *n == 1).map(|(k, _)| k).collect::<BTreeSet<String>>()
+        };
+        let (unique_l, unique_r) = (unique(l), unique(r));
+        let mut used = BTreeSet::new();
+        let mut unchanged = 0usize;
+        let mut changed = Vec::new();
+        let mut moved = Vec::new();
+        let mut renamed = Vec::new();
+        let mut removed = Vec::new();
+        for m in l {
+            if let Some(i) = r.iter().position(|x| x.path == m.path) {
+                used.insert(i);
+                match r.get(i) {
+                    Some(x) if same_content(x, m) => unchanged += 1,
+                    Some(x) => changed.push(json!({
+                        "path": m.path,
+                        "same_structure": x.fingerprint.is_some() && x.fingerprint == m.fingerprint,
+                        "bytes": [m.bytes, x.bytes],
+                        "exports": export_diff(m, x),
+                        "functions": diff(&set(m.functions.iter().map(String::as_str)), &set(x.functions.iter().map(String::as_str))),
+                    })),
+                    None => {}
+                }
+                continue;
+            }
+            if let Some(i) = r.iter().enumerate().position(|(i, x)| !used.contains(&i) && x.sha256 == m.sha256 && !m.sha256.is_empty()) {
+                used.insert(i);
+                moved.push(json!({"from": m.path, "to": r.get(i).map(|x| &x.path)}));
+                continue;
+            }
+            let hashless = without_build_hash(&m.path).filter(|k| unique_l.contains(k) && unique_r.contains(k));
+            if let Some(i) =
+                hashless.and_then(|k| r.iter().enumerate().position(|(i, x)| !used.contains(&i) && without_build_hash(&x.path).as_ref() == Some(&k)))
+            {
+                used.insert(i);
+                if let Some(x) = r.get(i) {
+                    changed.push(json!({
+                        "path": x.path,
+                        "was": m.path,
+                        "matched_by": "name without build hash",
+                        "same_structure": x.fingerprint.is_some() && x.fingerprint == m.fingerprint,
+                        "bytes": [m.bytes, x.bytes],
+                        "exports": export_diff(m, x),
+                        "functions": diff(&set(m.functions.iter().map(String::as_str)), &set(x.functions.iter().map(String::as_str))),
+                    }));
+                }
+                continue;
+            }
+            if let Some(i) = r.iter().enumerate().position(|(i, x)| !used.contains(&i) && x.fingerprint.is_some() && x.fingerprint == m.fingerprint) {
+                used.insert(i);
+                renamed.push(json!({"from": m.path, "to": r.get(i).map(|x| &x.path), "matched_by": "structure"}));
+                continue;
+            }
+            removed.push(m.path.clone());
+        }
+        let added: Vec<&String> = r.iter().enumerate().filter(|(i, _)| !used.contains(i)).map(|(_, x)| &x.path).collect();
+        json!({"unchanged": unchanged, "changed": changed, "moved": moved, "renamed": renamed, "added": added, "removed": removed})
+    }
+
+    fn module_strategy() -> impl Strategy<Value = ModuleSummary> {
+        (
+            prop::sample::select(vec!["main.js", "assets/app-Ab12cd.js", "assets/app-Qw34er.js", "chunk.js", "moved.js"]),
+            prop::sample::select(vec!["", "sha-a", "sha-b", "sha-c"]),
+            prop::option::of(prop::sample::select(vec!["fp-a", "fp-b", "fp-c"])),
+        )
+            .prop_map(|(path, sha256, fingerprint)| ModuleSummary {
+                path: path.into(),
+                kind: "script".into(),
+                sha256: sha256.into(),
+                fingerprint: fingerprint.map(str::to_owned),
+                ..Default::default()
+            })
+    }
+
+    fn graph_with_bundles(modules: Vec<ModuleSummary>) -> AppGraph {
+        AppGraph {
+            modules: modules
+                .into_iter()
+                .map(|mut module| {
+                    module.bundle_modules = vec![crate::js_app::BundleModuleSummary {
+                        id: module.path.clone(),
+                        sha256: module.sha256.clone(),
+                        fingerprint: module.fingerprint.clone().unwrap_or_default(),
+                        ..Default::default()
+                    }];
+                    module
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    fn linear_match_bundle_modules(l: &AppGraph, r: &AppGraph) -> Value {
+        let lm: Vec<(&str, &crate::js_app::BundleModuleSummary)> =
+            l.modules.iter().flat_map(|m| m.bundle_modules.iter().map(move |b| (m.path.as_str(), b))).collect();
+        let rm: Vec<(&str, &crate::js_app::BundleModuleSummary)> =
+            r.modules.iter().flat_map(|m| m.bundle_modules.iter().map(move |b| (m.path.as_str(), b))).collect();
+        let mut used = BTreeSet::new();
+        let mut tiers: BTreeMap<&str, usize> = BTreeMap::new();
+        let mut changed = Vec::new();
+        let mut removed = Vec::new();
+        for (path, module) in &lm {
+            let tier = [
+                ("content", rm.iter().enumerate().position(|(i, (_, x))| !used.contains(&i) && x.sha256 == module.sha256)),
+                ("structure", rm.iter().enumerate().position(|(i, (_, x))| !used.contains(&i) && x.fingerprint == module.fingerprint)),
+                ("id", rm.iter().enumerate().position(|(i, (_, x))| !used.contains(&i) && x.id == module.id)),
+            ]
+            .into_iter()
+            .find_map(|(tier, index)| index.map(|index| (tier, index)));
+            match tier {
+                Some((tier, index)) => {
+                    used.insert(index);
+                    *tiers.entry(tier).or_default() += 1;
+                    if tier == "id" && changed.len() < 2000 {
+                        changed.push(json!({"id": module.id, "file": path}));
+                    }
+                }
+                None => removed.push(json!({"id": module.id, "file": path})),
+            }
+        }
+        let added: Vec<Value> =
+            rm.iter().enumerate().filter(|(i, _)| !used.contains(i)).map(|(_, (path, module))| json!({"id": module.id, "file": path})).take(2000).collect();
+        json!({"left": lm.len(), "right": rm.len(), "matched_by": tiers, "changed": changed, "added": added, "removed": removed})
+    }
+
+    fn linear_compare_export_outlines(l: &AppGraph, r: &AppGraph) -> Value {
+        let mut rows = Vec::new();
+        let mut used = BTreeSet::new();
+        let mut changed = 0usize;
+        for module in l.modules.iter().filter(|module| module.kind == "script") {
+            let index = r
+                .modules
+                .iter()
+                .position(|other| other.path == module.path)
+                .or_else(|| r.modules.iter().position(|other| other.fingerprint.is_some() && other.fingerprint == module.fingerprint));
+            match index.and_then(|i| r.modules.get(i).map(|other| (i, other))) {
+                Some((i, other)) => {
+                    used.insert(i);
+                    let d = export_diff(module, other);
+                    let same = d["added"].as_array().is_some_and(Vec::is_empty)
+                        && d["removed"].as_array().is_some_and(Vec::is_empty)
+                        && d.get("module_exports").is_none();
+                    if !same {
+                        changed += 1;
+                    }
+                    rows.push(json!({"left": module.path, "right": other.path, "same": same, "diff": d, "left_outline": module.exports, "right_outline": other.exports}));
+                }
+                None => rows.push(json!({"left": module.path, "right": null, "removed": true, "left_outline": module.exports})),
+            }
+        }
+        for (i, module) in r.modules.iter().enumerate().filter(|(_, module)| module.kind == "script") {
+            if !used.contains(&i) {
+                rows.push(json!({"left": null, "right": module.path, "added": true, "right_outline": module.exports}));
+            }
+        }
+        json!({"modules": rows, "changed": changed})
+    }
+
+    proptest! {
+        #[test]
+        fn indexed_module_matching_matches_linear_reference_with_duplicate_keys(left in prop::collection::vec(module_strategy(), 0..32), right in prop::collection::vec(module_strategy(), 0..32)) {
+            prop_assert_eq!(match_modules(&left, &right), linear_match_modules(&left, &right));
+            let left_graph = graph_with_bundles(left);
+            let right_graph = graph_with_bundles(right);
+            prop_assert_eq!(match_bundle_modules(&left_graph, &right_graph), linear_match_bundle_modules(&left_graph, &right_graph));
+            prop_assert_eq!(compare_export_outlines(&left_graph, &right_graph), linear_compare_export_outlines(&left_graph, &right_graph));
+        }
+    }
 
     #[test]
     fn build_hashes_in_names_are_recognised_and_plain_words_are_not() {
