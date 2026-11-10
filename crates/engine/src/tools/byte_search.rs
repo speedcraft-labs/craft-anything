@@ -111,26 +111,24 @@ fn find_all(data: &[u8], pat: &Pat, cap: usize, cancelled: &dyn Fn() -> bool) ->
     let Some((anchor, Some(first))) = pat.iter().enumerate().find(|(_, b)| b.is_some()).map(|(i, b)| (i, *b)) else {
         return (hits, false);
     };
-    let mut i = anchor;
-    let mut scanned_since_check = 0usize;
-    while let Some(p) = data.get(i..).and_then(|h| h.iter().position(|&b| b == first)) {
-        scanned_since_check += p + 1;
-        if scanned_since_check > (8 << 20) {
-            scanned_since_check = 0;
-            if cancelled() {
-                return (hits, true);
+    // Search disjoint chunks once so a dense anchor uses memchr's vectorized iterator instead of
+    // paying for a new scalar `position` search and suffix iterator at every hit.
+    const CHUNK: usize = 1 << 20;
+    for (chunk_no, chunk) in data.get(anchor..).unwrap_or_default().chunks(CHUNK).enumerate() {
+        if cancelled() {
+            return (hits, true);
+        }
+        let chunk_start = anchor + chunk_no * CHUNK;
+        for at in memchr::memchr_iter(first, chunk) {
+            let start = chunk_start + at - anchor;
+            let ok = data.get(start..start + pat.len()).is_some_and(|w| w.iter().zip(pat).all(|(b, m)| m.is_none_or(|m| m == *b)));
+            if ok {
+                if hits.len() >= cap {
+                    return (hits, true);
+                }
+                hits.push(start);
             }
         }
-        let at = i + p;
-        let start = at - anchor;
-        let ok = data.get(start..start + pat.len()).is_some_and(|w| w.iter().zip(pat).all(|(b, m)| m.is_none_or(|m| m == *b)));
-        if ok {
-            if hits.len() >= cap {
-                return (hits, true);
-            }
-            hits.push(start);
-        }
-        i = at + 1;
     }
     (hits, false)
 }
@@ -291,6 +289,53 @@ mod tests {
         // A pattern longer than the data, or hanging off the end, never matches.
         let (h, _) = find_all(b"\xaa", &parse_pattern("aa bb").unwrap(), 10, &|| false);
         assert!(h.is_empty());
+    }
+
+    #[test]
+    fn anchored_search_matches_linear_reference() {
+        fn reference(data: &[u8], pat: &[Option<u8>], cap: usize) -> (Vec<usize>, bool) {
+            let mut hits = Vec::new();
+            for start in 0..=data.len().saturating_sub(pat.len()) {
+                if start + pat.len() <= data.len() && data[start..start + pat.len()].iter().zip(pat).all(|(b, m)| m.is_none_or(|m| m == *b)) {
+                    if hits.len() == cap {
+                        return (hits, true);
+                    }
+                    hits.push(start);
+                }
+            }
+            (hits, false)
+        }
+
+        let mut state = 0x9e37_79b9_u32;
+        let mut data = vec![0; (1 << 20) + 37];
+        for byte in &mut data {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            *byte = (state & 0xff) as u8;
+        }
+        data[(1 << 20) - 2..(1 << 20) + 3].copy_from_slice(&[0xaa, 0x01, 0xff, 0x02, 0xaa]);
+        for source in ["aa ?? 02", "?? aa ?? aa", "00 00", "ff"] {
+            let pat = parse_pattern(source).unwrap();
+            for cap in [0, 1, 100_000] {
+                assert_eq!(find_all(&data, &pat, cap, &|| false), reference(&data, &pat, cap), "pattern {source}, cap {cap}");
+            }
+        }
+    }
+
+    #[test]
+    fn checks_cancellation_between_chunks() {
+        use std::cell::Cell;
+
+        let data = vec![0; (1 << 20) * 3];
+        let checks = Cell::new(0);
+        let (hits, stopped) = find_all(&data, &parse_pattern("ff").unwrap(), 10, &|| {
+            checks.set(checks.get() + 1);
+            checks.get() == 2
+        });
+        assert!(hits.is_empty());
+        assert!(stopped);
+        assert_eq!(checks.get(), 2);
     }
 
     #[test]
